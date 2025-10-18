@@ -1,20 +1,13 @@
 # Server Deploy
 
-This directory contains the deployment assets for the SSA-CNN server, including the setup script, models, and required datasets.
+部署之后要快速使用，只需在服务器上依次执行：
 
-## Deployment Steps
+```bash
+chmod +x setup_server.sh
+./setup_server.sh
+```
 
-1. Copy this repository to the target server.
-2. Make the setup script executable:
-   ```bash
-   chmod +x setup_server.sh
-   ```
-3. Run the setup script to configure the environment:
-   ```bash
-   ./setup_server.sh
-   ```
-
-The script installs dependencies, arranges dataset files, and launches the optimized SSA-CNN service.
+The script installs dependencies, arranges dataset files, and launches the optimized SSA-CNN service with the assets in this folder.
 
 ## Repository Structure
 
