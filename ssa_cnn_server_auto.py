@@ -28,7 +28,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-import argparse
 # C++ accelerated SSA/STD functions
 from fasttimes import fastssa, faststd
 import time, json
@@ -42,7 +41,7 @@ MAX_ROWS_STD = 200000 # Increased for more stable STD basis
 DATA_DIR = "./dataset"
 DATASETS = [
     "exchange_rate.csv", "ETTh1.csv", "ETTh2.csv", "ETTm1.csv", "ETTm2.csv",
-    # "traffic.csv", "electricity.csv", "weather.csv",  # Removed - too many channels
+    # "traffic.csv", "electricity.csv", "weather.csv",  # Removed - too many channels (862/321/21)
 ]
 HORIZONS = [96, 192, 336, 720]
 
@@ -51,7 +50,9 @@ LOOKBACK_WINDOW = 336
 # Algorithm and model selection
 ALGO = 'SSA'  # 'STD' or 'SSA'
 LEARN_BASES_ON = 'train'  # 'train+val' or 'train'
-MODEL_TYPE = 'linear'  # 'linear' or 'cnn'
+MODEL_TYPE = 'cnn'  # 'linear' or 'cnn'
+
+# SSA basis backend: 'fft_eigh' (low-memory), 'svd' (build Hankel)
 
 # Server-optimized settings
 BUILD_BATCH = 8000
@@ -212,29 +213,18 @@ class STDDecomposer:
         if n_blocks == 0:
             return None
 
-        # faststd expects (n_samples, n_features), so transpose
-        X_forC = X.T.astype(np.float32, copy=False)
+        X_forC = X.astype(np.float32, copy=False)
         trend_c, disp_c, _ = faststd(X_forC, block_size=bs, seasonal_rank=self.seasonal_rank)
 
-        # Convert back to (n_channels, time) format and trim to blocks
+        trend = trend_c.T
+        dispersion = disp_c.T
+
         X_trim = X[:, :n_blocks * bs]
-        trend_full = trend_c.T if trend_c.ndim > 1 else trend_c.reshape(1, -1)
-        dispersion_full = disp_c.T if disp_c.ndim > 1 else disp_c.reshape(1, -1)
-        
-        # Trim trend and dispersion to match trimmed data
-        trend_trim = trend_full[:, :n_blocks * bs]
-        dispersion_trim = dispersion_full[:, :n_blocks * bs]
-        
-        # Reshape into blocks: (n_blocks, n_channels, block_size)
         Xb = X_trim.reshape(n_channels, n_blocks, bs).transpose(1, 0, 2).astype(np.float32, copy=False)
-        trend = trend_trim.reshape(n_channels, n_blocks, bs).transpose(1, 0, 2)
-        dispersion = dispersion_trim.reshape(n_channels, n_blocks, bs).transpose(1, 0, 2)
-        
-        # Calculate seasonal component
-        Xc = Xb - trend
+        Xc = Xb - trend[:, :, None]
         seasonal = np.zeros_like(Xc, dtype=np.float32)
         mask = dispersion > 1e-6
-        seasonal[mask] = Xc[mask] / dispersion[mask]
+        seasonal[mask] = Xc[mask] / dispersion[mask][:, None]
 
         return STDComponents(trend.astype(np.float32), dispersion.astype(np.float32), seasonal, bs, n_blocks)
 
@@ -258,6 +248,217 @@ class STDDecomposer:
         return self.seasonal_basis
 
 # ======================= SSA core (C++ ACCELERATED) =======================
+
+# ======================= SSA Helper Utilities (Improved Grouping) =======================
+
+# ======================= SSA Low-Memory Backend Helpers =======================
+import numpy as _np
+
+def _autocorr_fft(x: _np.ndarray, maxlag: int):
+    """Return biased autocorrelation r[0:maxlag] via FFT in O(T log T)."""
+    x = _np.asarray(x, dtype=_np.float32).ravel()
+    n = int(1) << (len(x) * 2 - 1).bit_length()
+    X = _np.fft.rfft(x, n=n)
+    S = X * _np.conj(X)
+    r = _np.fft.irfft(S, n=n).real[:maxlag]
+    # biased (divide by T), stable enough for SSA Gram Toeplitz
+    T = len(x)
+    r /= max(T, 1)
+    return r.astype(_np.float32)
+
+def _toeplitz_from_acf(r: _np.ndarray, L: int):
+    """Build LxL Toeplitz matrix from autocorrelation r (length >= L)."""
+    c = r[:L]
+    # Toeplitz with first column c and first row c (symmetric)
+    C = _np.lib.stride_tricks.as_strided(
+        _np.concatenate([c[::-1], c[1:]]),
+        shape=(L, L),
+        strides=(c.itemsize, c.itemsize)
+    )
+    # The as_strided trick above doesn't work reliably in all envs; fallback:
+    C = _np.array([[c[abs(i-j)] for j in range(L)] for i in range(L)], dtype=_np.float32)
+    return C
+
+def _valid_conv_fft(x: _np.ndarray, h: _np.ndarray):
+    """Valid-length convolution: returns length K = T-L+1 for len(h)=L."""
+    x = _np.asarray(x, dtype=_np.float32).ravel()
+    h = _np.asarray(h, dtype=_np.float32).ravel()
+    T = len(x); L = len(h)
+    K = max(0, T - L + 1)
+    if K <= 0:
+        return _np.zeros(0, dtype=_np.float32)
+    # Use FFT conv and slice the 'valid' segment
+    n = int(1) << (_np.ceil(_np.log2(T + L - 1)).astype(int))
+    X = _np.fft.rfft(x, n=n)
+    H = _np.fft.rfft(h[::-1], n=n)  # reverse for convolution
+    y = _np.fft.irfft(X * H, n=n).real
+    # valid region starts at L-1, ends at L-1+K
+    return y[L-1:L-1+K].astype(_np.float32)
+
+def _classify_groups_fast(U: _np.ndarray, s: _np.ndarray, x_ref: _np.ndarray, L: int, T: int,
+                          max_groups: int, f_low_mode='auto', q_thres=0.05):
+    """Classify groups without building V/Hankel:
+       - PCs approximated by vj = s_j * V_j = U_j^T H = valid_conv(x_ref, U_j)
+       - RC_j via outer(U_j, vj) then diagonal averaging.
+    """
+    # Build simple PCs proxy (vj) for pairing: s*V_j = U_j^T H ~ valid_conv(x_ref, U_j)
+    r = U.shape[1]
+    K = T - L + 1
+    PCs_proxy = _np.zeros((r, max(K, 1)), dtype=_np.float32)
+    for j in range(r):
+        vj = _valid_conv_fft(x_ref, U[:, j])  # length K
+        PCs_proxy[j, :len(vj)] = vj
+
+    groups = _pair_components(s, PCs_proxy, eps=0.1, corr_thres=0.6)
+
+    info = []
+    for g in groups:
+        Ug = U[:, g]; sg = s[g]
+        # Reconstruct RC using H_g = Ug @ (diag(sg) @ Vg) with Vg = vj / s_j.
+        # Here we only need vj*s_j = (s_j * V_j) = PCs_proxy[j], so H_g = sum_j U_j outer PCs_proxy[j]
+        H_g = _np.zeros((L, max(K, 1)), dtype=_np.float32)
+        for idx, j in enumerate(g):
+            vj = PCs_proxy[j, :K]
+            H_g += _np.outer(U[:, j], vj)
+        y_rc = _diag_average(H_g, T)
+        f0, Q = _dominant_freq_and_q(y_rc)
+        ent = _spectral_entropy(y_rc)
+        info.append({'idx': g, 'f0': f0, 'Q': Q, 'H': ent})
+
+    if f_low_mode == 'auto':
+        base = 1.0 / max(L, 1)
+        lows = [it['f0'] for it in info]
+        med = float(_np.median(lows)) if lows else base
+        f_low = max(base, min(0.1, 0.5 * med + 0.5 * base))
+    else:
+        f_low = float(f_low_mode)
+
+    trend_order, seasonal_order = [], []
+    for it in info:
+        f0, Q, H = it['f0'], it['Q'], it['H']
+        if f0 < f_low and Q < 0.20:
+            trend_order.extend(it['idx'])
+        elif Q >= q_thres and H < 0.9:
+            seasonal_order.extend(it['idx'])
+        else:
+            pass
+    trend_order = sorted(set(trend_order))
+    seasonal_order = [k for k in range(r) if (k in set(seasonal_order) and k not in trend_order)]
+    keep = (trend_order + seasonal_order)[:max_groups]
+    diag = {'f_low': f_low, 'groups': info, 'trend_idx': trend_order, 'seasonal_idx': seasonal_order}
+    return keep, diag
+
+import numpy as _np
+
+def _trajectory_matrix_1d(x: _np.ndarray, L: int):
+    x = _np.asarray(x, dtype=_np.float32).ravel()
+    T = x.shape[0]
+    K = max(0, T - L + 1)
+    if K <= 0:
+        return _np.zeros((L, 0), dtype=_np.float32)
+    H = _np.lib.stride_tricks.sliding_window_view(x, L).astype(_np.float32).T
+    return H  # (L, K)
+
+def _diag_average(H: _np.ndarray, T: int):
+    L, K = H.shape
+    y = _np.zeros(T, dtype=_np.float32)
+    counts = _np.zeros(T, dtype=_np.float32)
+    for i in range(L):
+        for j in range(K):
+            y[i + j] += H[i, j]
+            counts[i + j] += 1.0
+    counts[counts == 0] = 1.0
+    return y / counts
+
+def _dominant_freq_and_q(x: _np.ndarray):
+    x = _np.asarray(x, dtype=_np.float32).ravel()
+    n = x.shape[0]
+    if n < 8:
+        return 0.0, 0.0
+    X = _np.fft.rfft(x)
+    P = (X.real**2 + X.imag**2).astype(_np.float32)
+    if P.shape[0] <= 1:
+        return 0.0, 0.0
+    P1 = P.copy()
+    P1[0] = 0.0
+    idx = int(_np.argmax(P1))
+    total = float(_np.sum(P1) + 1e-12)
+    peak = float(P1[idx])
+    f_norm = idx / (len(P1) - 1) * 0.5
+    Q = peak / total
+    return f_norm, Q
+
+def _spectral_entropy(x: _np.ndarray):
+    x = _np.asarray(x, dtype=_np.float32).ravel()
+    X = _np.fft.rfft(x)
+    P = (X.real**2 + X.imag**2).astype(_np.float32)
+    s = P.sum()
+    if s == 0:
+        return 1.0
+    P = P / (s + 1e-12)
+    P = _np.clip(P, 1e-12, 1.0)
+    H = -_np.sum(P * _np.log(P))
+    H_max = _np.log(len(P))
+    return float(H / (H_max + 1e-12))
+
+def _pair_components(s: _np.ndarray, PCs: _np.ndarray, eps: float = 0.1, corr_thres: float = 0.6):
+    r = s.shape[0]
+    used = _np.zeros(r, dtype=bool)
+    groups = []
+    for j in range(r - 1):
+        if used[j]:
+            continue
+        rel_gap = abs(s[j] - s[j+1]) / max(s[j], 1e-12)
+        if rel_gap < eps:
+            x = PCs[j]; y = PCs[j+1]
+            x = (x - x.mean()) / (x.std() + 1e-8)
+            y = (y - y.mean()) / (y.std() + 1e-8)
+            corr = float((x @ y) / max(len(x) - 1, 1))
+            if corr > corr_thres:
+                groups.append([j, j+1])
+                used[j] = used[j+1] = True
+                continue
+        groups.append([j])
+        used[j] = True
+    if not used[-1]:
+        groups.append([r - 1])
+    return groups
+
+def _classify_groups(U: _np.ndarray, s: _np.ndarray, Vt: _np.ndarray, L: int, T: int,
+                     max_groups: int, f_low_mode='auto', q_thres=0.05):
+    r = U.shape[1]
+    PCs = (s[:, None] * Vt).astype(_np.float32)  # (r, K)
+    groups = _pair_components(s, PCs, eps=0.1, corr_thres=0.6)
+    info = []
+    for g in groups:
+        Ug = U[:, g]; sg = s[g]; Vg = Vt[g, :]
+        Hg = Ug @ (_np.diag(sg) @ Vg)  # (L, K)
+        y_rc = _diag_average(Hg, T)
+        f0, Q = _dominant_freq_and_q(y_rc)
+        ent = _spectral_entropy(y_rc)
+        info.append({'idx': g, 'f0': f0, 'Q': Q, 'H': ent})
+    if f_low_mode == 'auto':
+        base = 1.0 / max(L, 1)
+        lows = [it['f0'] for it in info]
+        med = float(_np.median(lows)) if lows else base
+        f_low = max(base, min(0.1, 0.5 * med + 0.5 * base))
+    else:
+        f_low = float(f_low_mode)
+    trend_order, seasonal_order = [], []
+    for it in info:
+        f0, Q, H = it['f0'], it['Q'], it['H']
+        if f0 < f_low and Q < 0.20:
+            trend_order.extend(it['idx'])
+        elif Q >= q_thres and H < 0.9:
+            seasonal_order.extend(it['idx'])
+        else:
+            pass
+    trend_order = sorted(set(trend_order))
+    seasonal_order = [k for k in range(r) if (k in set(seasonal_order) and k not in trend_order)]
+    keep = (trend_order + seasonal_order)[:max_groups]
+    diag = {'f_low': f_low, 'groups': info, 'trend_idx': trend_order, 'seasonal_idx': seasonal_order}
+    return keep, diag
+
 class SSAProjector:
     def __init__(self, L: int, seasonal_rank: int, r_trend: int = 1, max_samples: int = MAX_SAMPLES_SSA, seed: int = 0):
         self.L = int(L)
@@ -271,37 +472,58 @@ class SSAProjector:
         self._cpp_accelerated = True
 
     def fit_from_series(self, X: np.ndarray):
-        """Learn SSA basis - C++ accelerated reconstruction, Python SVD for basis"""
+        """Learn SSA basis using selected backend and improved grouping.
+        Backends:
+          - 'fft_eigh': build Gram Toeplitz from FFT autocorr (no Hankel), eig -> U,s
+          - 'svd': build Hankel and run SVD (higher memory)
+        """
         n_channels, T = X.shape
         if T < self.L:
             self.U = None; self.r_actual = 0; return
-
-        X_reconstructed = fastssa(X.astype(np.float32), L=self.L, r=self.r_total)
-
-        n_per_ch = T - self.L + 1
-        total = n_channels * max(0, n_per_ch)
-        if total <= 0:
-            self.U = None; self.r_actual = 0; return
-
-        take = min(total, self.max_samples)
-        idx = self.rng.choice(total, size=take, replace=False)
-        S = np.empty((self.L, take), dtype=np.float32)
-
-        for j, flat in enumerate(idx):
-            ch = flat // n_per_ch
-            st = flat % n_per_ch
-            seg = X_reconstructed[ch, st:st+self.L]
-            S[:, j] = seg - float(seg.mean())
-
-        U, s, Vt = np.linalg.svd(S, full_matrices=False)
-        r = min(self.r_total, U.shape[1])
-        self.U = U[:, :r].astype(np.float32, copy=False)
-        self.r_actual = int(r)
-
-        del S, U, s, Vt, X_reconstructed
+        ref = X.mean(axis=0).astype(np.float32)
+        backend = globals().get('SSA_BASIS_BACKEND', 'fft_eigh')
+        if backend == 'fft_eigh':
+            # Low-memory: eig on Toeplitz Gram from autocorr
+            r = _autocorr_fft(ref, self.L)
+            C = _toeplitz_from_acf(r, self.L)
+            w, U = np.linalg.eigh(C.astype(np.float32))
+            idx = np.argsort(w)[::-1]
+            w = w[idx]; U = U[:, idx]
+            s = np.sqrt(np.maximum(w, 0)).astype(np.float32)
+            keep_idx, diag = _classify_groups_fast(U, s, ref, self.L, T,
+                                                max_groups=self.r_total,
+                                                f_low_mode='auto', q_thres=0.05)
+            if len(keep_idx) == 0:
+                r_sel = min(self.r_total, U.shape[1])
+                self.U = U[:, :r_sel].astype(np.float32, copy=False)
+                self.r_actual = int(r_sel)
+            else:
+                self.U = U[:, keep_idx].astype(np.float32, copy=False)
+                self.r_actual = int(len(keep_idx))
+            self._diag = diag
+            del C, w, U, s
+        else:
+            # High-memory SVD of Hankel (fallback)
+            H = _trajectory_matrix_1d(ref, self.L)
+            if H.shape[1] == 0:
+                self.U = None; self.r_actual = 0; return
+            U, s, Vt = np.linalg.svd(H, full_matrices=False)
+            keep_idx, diag = _classify_groups(U, s, Vt, self.L, T,
+                                          max_groups=self.r_total,
+                                          f_low_mode='auto', q_thres=0.05)
+            if len(keep_idx) == 0:
+                r_sel = min(self.r_total, U.shape[1])
+                self.U = U[:, :r_sel].astype(np.float32, copy=False)
+                self.r_actual = int(r_sel)
+            else:
+                self.U = U[:, keep_idx].astype(np.float32, copy=False)
+                self.r_actual = int(len(keep_idx))
+            self._diag = diag
+            del H, U, s, Vt
         gc.collect()
 
     def project(self, x_window_1d: np.ndarray):
+self, x_window_1d: np.ndarray):
         if self.U is None or x_window_1d.shape[0] < self.L:
             return None, None, None
         seg = x_window_1d[-self.L:].astype(np.float32, copy=False)
@@ -848,7 +1070,7 @@ DATASET_TUNING = {
                 'raw_slope': 0.25, 'slow_means_K': 4, 'gate_24h_trend_after_weeks': 2, 'seasonal_rank_scale': 0.8},
     'weather': {'lookback': 336, 'primary_L': 168, 'seasonal_gate_ratio': 1.5,
                 'raw_slope': 0.35, 'slow_means_K': 3, 'gate_24h_trend_after_weeks': 1, 'seasonal_rank_scale': 0.7},
-    'exchange_rate': {'lookback': 336, 'primary_L': 30, 'seasonal_gate_ratio': 1.2,
+    'exchange_rate': {'lookback': 96, 'primary_L': 30, 'seasonal_gate_ratio': 1.2,
                       'raw_slope': 0.1, 'slow_means_K': 2, 'gate_24h_trend_after_weeks': 0,
                       'seasonal_rank_scale': 0.5},
 }
@@ -974,6 +1196,8 @@ def evaluate_train_only(file_path: str, lookback_default: int = LOOKBACK_WINDOW,
 
     if LEARN_BASES_ON == 'train':
         basis_data = X_train
+    else:
+        basis_data = np.concatenate([X_train, X_val], axis=1)
 
     if ALGO.upper() == 'STD':
         model = STDNeuralForecaster(lookback=lookback, block_sizes=block_sizes,
@@ -1025,50 +1249,53 @@ def evaluate_train_only(file_path: str, lookback_default: int = LOOKBACK_WINDOW,
     return results
 
 # ======================= Main =======================
-def main():
-    """
-    Main function to run the complete evaluation pipeline.
-    1. Loops through all specified datasets.
-    2. Evaluates the model performance on each dataset.
-    """
-    overall_results = {}
-    for dataset in DATASETS:
-        file_path = os.path.join(DATA_DIR, dataset)
-        print(f"\n{'='*40}\nEvaluating dataset: {dataset}")
-        if not os.path.exists(file_path):
-            print(f"[Skip] {file_path} not found")
-            continue
-        results = evaluate_train_only(file_path)
-        overall_results[dataset] = results
-
-    # Save overall results to a JSON file
-    output_file = "evaluation_results.json"
-    with open(output_file, 'w') as f:
-        json.dump(overall_results, f, indent=4)
-    print(f"\nResults saved to: {output_file}")
-
-
 def run_evaluation():
-    parser = argparse.ArgumentParser(description='SSA/STD CNN/Linear Forecasting')
-    parser.add_argument('--algo', type=str, required=True, choices=['SSA', 'STD'], help='Decomposition algorithm: SSA or STD')
-    parser.add_argument('--model_type', type=str, required=True, choices=['linear', 'cnn'], help='Model type: linear or cnn')
-    parser.add_argument('--datasets', type=str, default=None, help='Comma-separated list of dataset files to process')
-    args = parser.parse_args()
+    print("="*80)
+    print(f"{ALGO}-{MODEL_TYPE.upper()} Model - Server Optimized (In-Memory)")
+    print("="*80)
+    print(f"Device: {DEVICE} | Batch: {BATCH_SIZE} | Epochs: {EPOCHS}")
+    print(f"Basis: {LEARN_BASES_ON.upper()} | Model: TRAIN with VAL early stopping")
+    print("="*80)
 
-    global ALGO, MODEL_TYPE, DATASETS
-    ALGO = args.algo
-    MODEL_TYPE = args.model_type
+    all_results = []
 
-    if args.datasets:
-        DATASETS = [d.strip() for d in args.datasets.split(',')]
-    else:
-        # Default datasets if not provided
-        DATASETS = [
-            "exchange_rate.csv", "ETTh1.csv", "ETTh2.csv", "ETTm1.csv", "ETTm2.csv"
-        ]
-    
-    main()
+    for dataset in DATASETS:
+        filepath = os.path.join(DATA_DIR, dataset)
+        if not os.path.exists(filepath):
+            print(f"[Skip] {filepath} not found")
+            continue
+        try:
+            results = evaluate_train_only(filepath)
 
+            row = {
+                'dataset': dataset,
+                'model': f'{ALGO}_{MODEL_TYPE}',
+                'algo': ALGO,
+                'model_type': MODEL_TYPE
+            }
+
+            for horizon in HORIZONS:
+                row[f'mse_{horizon}'] = results[horizon]['mse']
+                row[f'mae_{horizon}'] = results[horizon]['mae']
+
+            all_results.append(row)
+
+        except Exception as e:
+            print(f"[Error] Failed on {dataset}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if all_results:
+        df_results = pd.DataFrame(all_results)
+        timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f"{ALGO}_{MODEL_TYPE}_server_optimized_{timestamp}.csv"
+        df_results.to_csv(output_file, index=False)
+
+        print("\n" + "="*80)
+        print("RESULTS SUMMARY")
+        print("="*80)
+        print(df_results.to_string())
+        print(f"\nResults saved to: {output_file}")
 
 if __name__ == "__main__":
     print("System Configuration:")

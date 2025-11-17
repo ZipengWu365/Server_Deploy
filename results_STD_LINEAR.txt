@@ -1,0 +1,73 @@
+================================================================================
+STD-LINEAR Model Results
+================================================================================
+Device: cuda (NVIDIA GeForce RTX 3080 Ti)
+Batch: 1024 | Epochs: 10
+Model: Linear regression with STD-decomposed features
+================================================================================
+
+Dataset: exchange_rate.csv
+Config: lookback=96 | primary_L=30
+Features: 180 (STD multi-scale: 7/30/1440)
+Results:
+  H=96:  MSE=0.0604  MAE=0.1851
+  H=192: MSE=0.1090  MAE=0.2482
+  H=336: MSE=0.1732  MAE=0.3258
+  H=720: MSE=0.4757  MAE=0.5385
+
+================================================================================
+Dataset: ETTh1.csv
+Config: lookback=336 | primary_L=168
+Features: 738 (STD multi-scale: 24/168/504/1440)
+Results:
+  H=96:  MSE=0.3419  MAE=0.3814
+  H=192: MSE=0.3568  MAE=0.4077
+  H=336: MSE=0.3710  MAE=0.4269
+  H=720: MSE=0.4085  MAE=0.4723
+
+================================================================================
+Dataset: ETTh2.csv
+Config: lookback=336 | primary_L=168
+Features: 738 (STD multi-scale: 24/168/504/1440)
+Results:
+  H=96:  MSE=0.2475  MAE=0.3359
+  H=192: MSE=0.3011  MAE=0.3786
+  H=336: MSE=0.3367  MAE=0.4123
+  H=720: MSE=0.4696  MAE=0.5107
+
+================================================================================
+Dataset: ETTm1.csv
+Config: lookback=672 | primary_L=672
+Features: 2229 (STD multi-scale: 96/672/1440)
+Results:
+  H=96:  MSE=0.2662  MAE=0.3517
+  H=192: MSE=0.3170  MAE=0.3859
+  H=336: MSE=0.3345  MAE=0.3987
+  H=720: MSE=0.4359  MAE=0.4796
+
+================================================================================
+Dataset: ETTm2.csv
+Config: lookback=672 | primary_L=672
+Features: 2229 (STD multi-scale: 96/672/1440)
+Results:
+  H=96:  MSE=0.1925  MAE=0.2963
+  H=192: MSE=0.2893  MAE=0.3697
+  H=336: MSE=0.3430  MAE=0.3792
+  H=720: MSE=0.4053  MAE=0.4565
+
+================================================================================
+Summary Statistics
+================================================================================
+Average MSE across all datasets and horizons:
+  H=96:  0.2217
+  H=192: 0.2746
+  H=336: 0.3157
+  H=720: 0.4190
+
+Average MAE across all datasets and horizons:
+  H=96:  0.3101
+  H=192: 0.3580
+  H=336: 0.3906
+  H=720: 0.4715
+
+Overall average: MSE=0.3078, MAE=0.3826

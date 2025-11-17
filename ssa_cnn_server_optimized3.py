@@ -28,7 +28,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-import argparse
 # C++ accelerated SSA/STD functions
 from fasttimes import fastssa, faststd
 import time, json
@@ -36,22 +35,23 @@ import time, json
 # ============================ Server-Optimized Config ============================
 # 🔑 Key parameters for server environment
 CHUNK_SIZE_CHANNELS = 100  # Increased for faster basis learning
-MAX_SAMPLES_SSA = 100000 # Increased for more stable SSA basis
-MAX_ROWS_STD = 200000 # Increased for more stable STD basis
+
+# SSA/STD sampling limits
+MAX_SAMPLES_SSA = 50000  # Maximum samples for SSA basis learning
+MAX_ROWS_STD = 100000    # Maximum rows for STD seasonal basis
 
 DATA_DIR = "./dataset"
 DATASETS = [
-    "exchange_rate.csv", "ETTh1.csv", "ETTh2.csv", "ETTm1.csv", "ETTm2.csv",
-    # "traffic.csv", "electricity.csv", "weather.csv",  # Removed - too many channels
+    "exchange_rate.csv","ETTh1.csv", "ETTh2.csv", "ETTm1.csv", "ETTm2.csv"
 ]
 HORIZONS = [96, 192, 336, 720]
 
 LOOKBACK_WINDOW = 336
 
 # Algorithm and model selection
-ALGO = 'SSA'  # 'STD' or 'SSA'
-LEARN_BASES_ON = 'train'  # 'train+val' or 'train'
-MODEL_TYPE = 'linear'  # 'linear' or 'cnn'
+ALGO = 'CNNONLY'  # 'CNNONLY' (ablation) | 'STD' | 'SSA'
+MODEL_TYPE = 'cnn'  # 'linear' or 'cnn'
+LEARN_BASES_ON = 'train'  # 'train' only
 
 # Server-optimized settings
 BUILD_BATCH = 8000
@@ -212,29 +212,18 @@ class STDDecomposer:
         if n_blocks == 0:
             return None
 
-        # faststd expects (n_samples, n_features), so transpose
-        X_forC = X.T.astype(np.float32, copy=False)
+        X_forC = X.astype(np.float32, copy=False)
         trend_c, disp_c, _ = faststd(X_forC, block_size=bs, seasonal_rank=self.seasonal_rank)
 
-        # Convert back to (n_channels, time) format and trim to blocks
+        trend = trend_c.T
+        dispersion = disp_c.T
+
         X_trim = X[:, :n_blocks * bs]
-        trend_full = trend_c.T if trend_c.ndim > 1 else trend_c.reshape(1, -1)
-        dispersion_full = disp_c.T if disp_c.ndim > 1 else disp_c.reshape(1, -1)
-        
-        # Trim trend and dispersion to match trimmed data
-        trend_trim = trend_full[:, :n_blocks * bs]
-        dispersion_trim = dispersion_full[:, :n_blocks * bs]
-        
-        # Reshape into blocks: (n_blocks, n_channels, block_size)
         Xb = X_trim.reshape(n_channels, n_blocks, bs).transpose(1, 0, 2).astype(np.float32, copy=False)
-        trend = trend_trim.reshape(n_channels, n_blocks, bs).transpose(1, 0, 2)
-        dispersion = dispersion_trim.reshape(n_channels, n_blocks, bs).transpose(1, 0, 2)
-        
-        # Calculate seasonal component
-        Xc = Xb - trend
+        Xc = Xb - trend[:, :, None]
         seasonal = np.zeros_like(Xc, dtype=np.float32)
         mask = dispersion > 1e-6
-        seasonal[mask] = Xc[mask] / dispersion[mask]
+        seasonal[mask] = Xc[mask] / dispersion[mask][:, None]
 
         return STDComponents(trend.astype(np.float32), dispersion.astype(np.float32), seasonal, bs, n_blocks)
 
@@ -547,6 +536,37 @@ class BaseForecaster:
 
         return preds
 
+# ======================= Raw CNN Forecaster (Ablation) =======================
+class RawCNNForecaster(BaseForecaster):
+    """
+    纯 CNN 消融：仅使用原始 lookback 窗口作为特征；不进行 SSA/STD 表示学习、
+    不加入额外统计/趋势特征。训练/验证/评测流程沿用统一管线。
+    """
+    def __init__(self, lookback: int):
+        super().__init__()
+        self.lookback = int(lookback)
+
+    def _extract_features_single(self, x_window_1d: np.ndarray, collect_slices: bool = False):
+        vec = x_window_1d.astype(np.float32, copy=False).ravel()
+        if collect_slices:
+            self.group_slices = {'raw': slice(0, vec.shape[0])}
+        return vec
+
+    def _identity_weight(self, horizon: int):
+        w = np.ones((self.n_features_,), dtype=np.float32)
+        zero_mask = np.zeros((self.n_features_,), dtype=bool)
+        return w, zero_mask
+
+    def fit(self, basis_data: np.ndarray, ridge_train_data: np.ndarray,
+            val_data: np.ndarray, horizons: List[int]):
+        # 仅用于确定特征维度（= lookback）
+        self._infer_feature_dim_and_groups(ridge_train_data[0, :self.lookback],
+                                           self._extract_features_single)
+        # 进入统一训练例程
+        self._build_and_fit_model(ridge_train_data, val_data, horizons,
+                                  extractor=self._extract_features_single,
+                                  weight_maker=self._identity_weight)
+
 # ======================= STD Forecaster =======================
 class STDNeuralForecaster(BaseForecaster):
     def __init__(self, lookback: int, block_sizes: List[int], seasonal_ranks: List[int],
@@ -848,7 +868,7 @@ DATASET_TUNING = {
                 'raw_slope': 0.25, 'slow_means_K': 4, 'gate_24h_trend_after_weeks': 2, 'seasonal_rank_scale': 0.8},
     'weather': {'lookback': 336, 'primary_L': 168, 'seasonal_gate_ratio': 1.5,
                 'raw_slope': 0.35, 'slow_means_K': 3, 'gate_24h_trend_after_weeks': 1, 'seasonal_rank_scale': 0.7},
-    'exchange_rate': {'lookback': 336, 'primary_L': 30, 'seasonal_gate_ratio': 1.2,
+    'exchange_rate': {'lookback': 96, 'primary_L': 30, 'seasonal_gate_ratio': 1.2,
                       'raw_slope': 0.1, 'slow_means_K': 2, 'gate_24h_trend_after_weeks': 0,
                       'seasonal_rank_scale': 0.5},
 }
@@ -972,20 +992,27 @@ def evaluate_train_only(file_path: str, lookback_default: int = LOOKBACK_WINDOW,
     print(f"Split: {'standard' if used_standard else 'ratio'}")
     print(f"Protocol: BASIS on {LEARN_BASES_ON.upper()}, Model on TRAIN")
 
-    if LEARN_BASES_ON == 'train':
-        basis_data = X_train
+    basis_data = X_train
 
     if ALGO.upper() == 'STD':
         model = STDNeuralForecaster(lookback=lookback, block_sizes=block_sizes,
                                     seasonal_ranks=seasonal_ranks, group_multipliers=None)
-    else:
+        apply_dataset_patch(model, ds_key, cfg, algo=ALGO)
+    elif ALGO.upper() == 'SSA':
         model = SSANeuralForecaster(lookback=lookback, block_sizes=block_sizes,
                                    seasonal_ranks=seasonal_ranks, group_multipliers=None)
-
-    apply_dataset_patch(model, ds_key, cfg, algo=ALGO)
+        apply_dataset_patch(model, ds_key, cfg, algo=ALGO)
+    elif ALGO.upper() == 'CNNONLY':
+        # 纯 CNN 消融：不应用任何 dataset patch/gating
+        model = RawCNNForecaster(lookback=lookback)
+    else:
+        raise ValueError(f"Unknown ALGO: {ALGO}")
 
     model.fit(basis_data=basis_data, ridge_train_data=X_train,
              val_data=X_val, horizons=horizons)
+    # 自检：RawCNN 消融时，特征维度应等于 lookback
+    if ALGO.upper() == 'CNNONLY':
+        assert getattr(model, 'n_features_', None) in (None, lookback), 'Raw CNN ablation: feature dim should equal lookback.'
 
     results = {}
     for horizon in horizons:
@@ -1025,50 +1052,53 @@ def evaluate_train_only(file_path: str, lookback_default: int = LOOKBACK_WINDOW,
     return results
 
 # ======================= Main =======================
-def main():
-    """
-    Main function to run the complete evaluation pipeline.
-    1. Loops through all specified datasets.
-    2. Evaluates the model performance on each dataset.
-    """
-    overall_results = {}
-    for dataset in DATASETS:
-        file_path = os.path.join(DATA_DIR, dataset)
-        print(f"\n{'='*40}\nEvaluating dataset: {dataset}")
-        if not os.path.exists(file_path):
-            print(f"[Skip] {file_path} not found")
-            continue
-        results = evaluate_train_only(file_path)
-        overall_results[dataset] = results
-
-    # Save overall results to a JSON file
-    output_file = "evaluation_results.json"
-    with open(output_file, 'w') as f:
-        json.dump(overall_results, f, indent=4)
-    print(f"\nResults saved to: {output_file}")
-
-
 def run_evaluation():
-    parser = argparse.ArgumentParser(description='SSA/STD CNN/Linear Forecasting')
-    parser.add_argument('--algo', type=str, required=True, choices=['SSA', 'STD'], help='Decomposition algorithm: SSA or STD')
-    parser.add_argument('--model_type', type=str, required=True, choices=['linear', 'cnn'], help='Model type: linear or cnn')
-    parser.add_argument('--datasets', type=str, default=None, help='Comma-separated list of dataset files to process')
-    args = parser.parse_args()
+    print("="*80)
+    print(f"{ALGO}-{MODEL_TYPE.upper()} Model - Server Optimized (In-Memory)")
+    print("="*80)
+    print(f"Device: {DEVICE} | Batch: {BATCH_SIZE} | Epochs: {EPOCHS}")
+    print(f"Basis: TRAIN only | Model: TRAIN with VAL early stopping")
+    print("="*80)
 
-    global ALGO, MODEL_TYPE, DATASETS
-    ALGO = args.algo
-    MODEL_TYPE = args.model_type
+    all_results = []
 
-    if args.datasets:
-        DATASETS = [d.strip() for d in args.datasets.split(',')]
-    else:
-        # Default datasets if not provided
-        DATASETS = [
-            "exchange_rate.csv", "ETTh1.csv", "ETTh2.csv", "ETTm1.csv", "ETTm2.csv"
-        ]
-    
-    main()
+    for dataset in DATASETS:
+        filepath = os.path.join(DATA_DIR, dataset)
+        if not os.path.exists(filepath):
+            print(f"[Skip] {filepath} not found")
+            continue
+        try:
+            results = evaluate_train_only(filepath)
 
+            row = {
+                'dataset': dataset,
+                'model': f'{ALGO}_{MODEL_TYPE}',
+                'algo': ALGO,
+                'model_type': MODEL_TYPE
+            }
+
+            for horizon in HORIZONS:
+                row[f'mse_{horizon}'] = results[horizon]['mse']
+                row[f'mae_{horizon}'] = results[horizon]['mae']
+
+            all_results.append(row)
+
+        except Exception as e:
+            print(f"[Error] Failed on {dataset}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if all_results:
+        df_results = pd.DataFrame(all_results)
+        timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f"{ALGO}_{MODEL_TYPE}_server_optimized_{timestamp}.csv"
+        df_results.to_csv(output_file, index=False)
+
+        print("\n" + "="*80)
+        print("RESULTS SUMMARY")
+        print("="*80)
+        print(df_results.to_string())
+        print(f"\nResults saved to: {output_file}")
 
 if __name__ == "__main__":
     print("System Configuration:")
