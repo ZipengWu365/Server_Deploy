@@ -1,0 +1,17 @@
+# ETTm1 Baseline
+dataset:
+  name: ETTm1
+  path: dataset/ETTm1.csv
+  split: [34465, 11521, 11521]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+decomp: []
+ablation_modes: ["RAW"]
+
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/baseline/ETTm1/

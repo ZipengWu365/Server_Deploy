@@ -1,0 +1,6 @@
+numpy
+statsmodels
+scipy
+EMD-signal
+PyWavelets
+faiss-cpu

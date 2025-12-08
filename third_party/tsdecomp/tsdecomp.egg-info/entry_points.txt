@@ -1,0 +1,2 @@
+[console_scripts]
+decomp-linear-bench = features.decomp_linear_bench.cli:main

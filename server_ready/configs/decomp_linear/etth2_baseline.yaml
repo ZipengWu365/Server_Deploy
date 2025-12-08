@@ -1,0 +1,17 @@
+# ETTh2 Baseline
+dataset:
+  name: ETTh2
+  path: dataset/ETTh2.csv
+  split: [8545, 2881, 2881]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+decomp: []
+ablation_modes: ["RAW"]
+
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/baseline/ETTh2/

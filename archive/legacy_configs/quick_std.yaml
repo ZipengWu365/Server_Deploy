@@ -1,0 +1,11 @@
+dataset:
+  name: ETTh1
+  path: dataset/ETTh1.csv
+lookback: 336
+horizons: [96]
+decomp: ["STD_MULTI","STD_FULL"]
+ablation_modes: ["T","S","D","T+S+D"]
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+out_dir: outputs/decomp_linear_bench/quick_std/

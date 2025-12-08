@@ -1,0 +1,21 @@
+# ETTh1 Baseline - Only use RAW lookback
+# Baseline for all decomposition component experiments
+
+dataset:
+  name: ETTh1
+  path: dataset/ETTh1.csv
+  split: [8545, 2881, 2881]  # train, val, test
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+# Baseline: No decomposition, use raw series directly
+decomp: []
+ablation_modes: ["RAW"]
+
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/baseline/ETTh1/

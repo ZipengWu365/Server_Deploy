@@ -1,0 +1,30 @@
+# Electricity 全方法分解实�?
+dataset:
+  name: electricity
+  path: dataset/electricity.csv
+  split: [18317, 2633, 5261]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+decomp:
+  - method: STD_MULTI
+    params: {block_size: 168}
+  - method: STL
+    params: {period: 168}
+  - method: SSA
+    params: {window: 168, n_components: 10}
+  - method: EMD
+    params: {}
+  - method: MA_BASELINE
+    params: {window: 168}
+  - method: WAVELET
+    params: {wavelet: "db4", level: 5}
+
+ablation_modes: ["+T", "+S"]
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/all_methods/electricity/

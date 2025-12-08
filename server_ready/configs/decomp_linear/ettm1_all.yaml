@@ -1,0 +1,31 @@
+﻿# ETTm1 all methods (15-min data, period=96)
+dataset:
+  name: ETTm1
+  path: dataset/ETTm1.csv
+  split: [34465, 11521, 11521]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+decomp:
+  - method: STL
+    params: {period: 96}
+  - method: SSA
+    params: {window: 96, n_components: 10}
+  - method: EMD
+    params: {}
+  - method: MA_BASELINE
+    params: {window: 96}
+  - method: WAVELET
+    params: {wavelet: db4, level: 4}
+  - method: STD_MULTI
+    params: {block_size: 96}
+
+ablation_modes: ["+T", "+S"]
+
+learner: Ridge
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/all_methods/ETTm1/

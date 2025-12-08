@@ -1,0 +1,31 @@
+﻿# ETTh2 all methods
+dataset:
+  name: ETTh2
+  path: dataset/ETTh2.csv
+  split: [8545, 2881, 2881]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+decomp:
+  - method: STL
+    params: {period: 24}
+  - method: SSA
+    params: {window: 48, n_components: 10}
+  - method: EMD
+    params: {}
+  - method: MA_BASELINE
+    params: {window: 24}
+  - method: WAVELET
+    params: {wavelet: db4, level: 4}
+  - method: STD_MULTI
+    params: {block_size: 24}
+
+ablation_modes: ["+T", "+S"]
+
+learner: Ridge
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/all_methods/ETTh2/

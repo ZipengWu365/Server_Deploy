@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsdecomp"
+version = "0.1.0"
+description = "Time series decomposition package"
+dependencies = [
+    "numpy",
+    "statsmodels",
+    "scipy",
+    "EMD-signal",
+    "PyWavelets",
+    "faiss-cpu",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[project.scripts]
+decomp-linear-bench = "features.decomp_linear_bench.cli:main"

@@ -1,0 +1,31 @@
+﻿# Exchange Rate all methods (daily data, period=5)
+dataset:
+  name: exchange_rate
+  path: dataset/exchange_rate.csv
+  split: [5120, 665, 1422]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+decomp:
+  - method: STL
+    params: {period: 5}
+  - method: SSA
+    params: {window: 21, n_components: 5}
+  - method: EMD
+    params: {}
+  - method: MA_BASELINE
+    params: {window: 21}
+  - method: WAVELET
+    params: {wavelet: db4, level: 4}
+  - method: STD_MULTI
+    params: {block_size: 5}
+
+ablation_modes: ["+T", "+S"]
+
+learner: Ridge
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/all_methods/exchange_rate/

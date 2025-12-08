@@ -1,0 +1,30 @@
+# Weather 全方法分解实�?(10分钟数据)
+dataset:
+  name: weather
+  path: dataset/weather.csv
+  split: [36792, 5271, 10540]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+decomp:
+  - method: STD_MULTI
+    params: {block_size: 288}  # 2�?
+  - method: STL
+    params: {period: 288}
+  - method: SSA
+    params: {window: 288, n_components: 10}
+  - method: EMD
+    params: {}
+  - method: MA_BASELINE
+    params: {window: 288}
+  - method: WAVELET
+    params: {wavelet: "db4", level: 5}
+
+ablation_modes: ["+T", "+S"]
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/all_methods/weather/

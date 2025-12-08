@@ -1,0 +1,23 @@
+# ETTh1 STD 多尺度实�?
+dataset:
+  name: ETTh1
+  path: dataset/ETTh1.csv
+  split: [8545, 2881, 2881]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+
+decomp:
+  - method: STD_MULTI
+    params: {block_size: 168}   # 周周�?
+  - method: STD_MULTI
+    params: {block_size: 336}   # 2�?
+
+ablation_modes: ["+T", "+S"]
+
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/std_multiscale/ETTh1/

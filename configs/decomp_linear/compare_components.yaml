@@ -1,0 +1,27 @@
+# 组件对比实验 - STD vs STL vs SSA vs MA
+dataset:
+  name: ETTh1
+  path: dataset/ETTh1.csv
+  split: [8545, 2881, 2881]
+
+lookback: 336
+horizons: [96, 336]
+
+decomp:
+  - method: STD_MULTI
+    params: {block_size: 24}
+  - method: STL
+    params: {period: 24}
+  - method: SSA
+    params: {window: 48, n_components: 10}
+  - method: MA_BASELINE
+    params: {window: 24}
+
+ablation_modes: ["+T", "+S"]
+
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/compare_components/

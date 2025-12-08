@@ -1,0 +1,17 @@
+# Exchange Rate Baseline
+dataset:
+  name: exchange_rate
+  path: dataset/exchange_rate.csv
+  split: [5120, 665, 1422]
+
+lookback: 336
+horizons: [96, 192, 336, 720]
+decomp: []
+ablation_modes: ["RAW"]
+
+learner: "Ridge"
+learner_params:
+  alpha: 1.0
+
+seed: 42
+out_dir: outputs/decomp_linear_bench/baseline/exchange_rate/

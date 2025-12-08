@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Outputs
+outputs/
+experiment_log.txt
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large dataset files (GitHub size limit exceeded)
+dataset/electricity.csv
+dataset/traffic.csv
+
+# Temporary files
+*.tmp
+*.bak
