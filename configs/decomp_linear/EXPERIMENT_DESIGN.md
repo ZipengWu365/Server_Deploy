@@ -98,24 +98,138 @@ result = decompose(x, cfg)
 | Alpha | 1.0 | 正则化强度 |
 | Seed | 42 | 随机种子 |
 
-### 成分实验矩阵
+### 分解模式选择：Per-Window vs Global Pattern
 
-每个实验测试 **lookback + 分解成分** 对 Ridge 回归的影响：
+**重要决策**：测试时是否需要重新分解？
 
-**特征构造方式**：
+#### 模式A：Per-Window Decomposition（当前实现）
 ```python
-# 输入特征 = 原始序列 拼接 分解成分
-feature = np.concatenate([raw[-336:], component[-336:]])  # shape: (672,)
+# 每个滑动窗口独立分解
+for window in test_windows:
+    trend, seasonal = decompose(window)
+    feature = concat(window, trend, seasonal)
+```
+- ✅ 适用于：EMD, Wavelet（自适应方法）
+- ✅ 捕捉局部变化
+- ❌ 计算量大，假设测试时可以看到完整lookback窗口
+
+#### 模式B：Global Pattern Decomposition（推荐用于STL/SSA）
+```python
+# 只在训练集上分解一次
+train_trend, train_seasonal = decompose(train_data)
+
+# 测试时使用全局模式
+for i, window in enumerate(test_windows):
+    # 使用训练集学到的周期/趋势模式
+    trend_slice = train_trend[i:i+336]
+    seasonal_slice = train_seasonal[i:i+336]
+    feature = concat(window, trend_slice, seasonal_slice)
+```
+- ✅ 适用于：STL, SSA（周期性稳定的方法）
+- ✅ 真实场景：周期模式在训练时确定
+- ✅ 计算高效
+- ❌ 假设模式固定
+
+**本实验采用模式A**，未来可扩展支持模式B。
+
+---
+
+### 多尺度分解实验设计
+
+每种分解方法在**多个时间尺度**上提取成分：
+
+#### 单尺度实验（基础）
+| 方法 | 尺度参数 | 成分 | 输入特征 | 特征维度 |
+|------|----------|------|----------|----------|
+| Baseline | - | - | `raw[-336:]` | 336 |
+| STL-24 | period=24 | +T | `concat(raw, trend_24)` | 672 |
+| STL-24 | period=24 | +S | `concat(raw, seasonal_24)` | 672 |
+| STL-168 | period=168 | +T | `concat(raw, trend_168)` | 672 |
+| STL-168 | period=168 | +S | `concat(raw, seasonal_168)` | 672 |
+
+#### 多尺度实验（组合）
+```python
+# 方案1: 多个尺度的趋势成分
+feature = concat(raw, trend_24, trend_168)  # dim: 336+336+336=1008
+
+# 方案2: 多个尺度的季节性成分  
+feature = concat(raw, seasonal_24, seasonal_168)
+
+# 方案3: 混合多尺度
+feature = concat(raw, trend_24, seasonal_168)
 ```
 
-| 方法 | 成分 | 输入特征 | 特征维度 |
-|------|------|----------|----------|
-| Baseline | - | `raw[-336:]` | 336 |
-| STL | +T | `concat(raw[-336:], trend[-336:])` | 672 |
-| STL | +S | `concat(raw[-336:], seasonal[-336:])` | 672 |
-| SSA | +T | `concat(raw[-336:], trend[-336:])` | 672 |
-| SSA | +S | `concat(raw[-336:], seasonal[-336:])` | 672 |
-| ... | ... | ... | ... |
+| 实验 | 成分组合 | 输入特征 | 特征维度 |
+|------|----------|----------|----------|
+| Multi-T | 多尺度趋势 | `concat(raw, T_24, T_168)` | 1008 |
+| Multi-S | 多尺度季节 | `concat(raw, S_24, S_168)` | 1008 |
+| Multi-TS | 单尺度T+S | `concat(raw, T_24, S_24)` | 1008 |
+| Multi-Mix | 跨尺度混合 | `concat(raw, T_24, S_168)` | 1008 |
+
+---
+
+### SSA 特定配置
+
+SSA 方法的参数需要根据数据集调整：
+
+#### SSA 窗口大小（Window Size）
+```python
+# 经验法则：window = lookback / 2 到 lookback / 3
+```
+
+| 数据集 | Lookback | 推荐 Window | 说明 |
+|--------|----------|-------------|------|
+| ETTh1/h2 | 336 | 112 ~ 168 | ~1周数据 |
+| ETTm1/m2 | 336 | 112 ~ 168 | ~1.17天 |
+| Exchange | 336 | 112 ~ 168 | ~16周 |
+
+#### SSA 成分分组（Trend vs Seasonal）
+```python
+# SSA 分解后得到多个特征值对应的成分
+# 需要手动分组为 Trend 和 Seasonal
+
+# 方案1: 前N个为趋势，其余为季节
+n_components = 10
+trend_indices = [0, 1, 2]  # 前3个主成分为趋势
+seasonal_indices = [3, 4, 5, 6]  # 中间若干为季节
+
+# 方案2: 根据周期性判断
+# - 低频成分 (前1-3) → Trend
+# - 中频成分 (4-8) → Seasonal  
+# - 高频成分 (9+) → Noise (舍弃)
+```
+
+**推荐 SSA 配置**：
+```yaml
+SSA:
+  window: 112  # lookback / 3
+  n_components: 10
+  trend_indices: [0, 1, 2]  # 前3个特征值
+  seasonal_indices: [3, 4, 5, 6, 7]  # 中间5个
+```
+
+---
+
+### 完整实验矩阵
+
+| 方法 | 尺度 | 成分 | 输入特征 | 特征维度 |
+|------|------|------|----------|----------|
+| **Baseline** | - | RAW | `raw` | 336 |
+| **STL** | 24 | +T | `concat(raw, T_24)` | 672 |
+| **STL** | 24 | +S | `concat(raw, S_24)` | 672 |
+| **STL** | 168 | +T | `concat(raw, T_168)` | 672 |
+| **STL** | 168 | +S | `concat(raw, S_168)` | 672 |
+| **STL-Multi** | [24,168] | +T | `concat(raw, T_24, T_168)` | 1008 |
+| **STL-Multi** | [24,168] | +S | `concat(raw, S_24, S_168)` | 1008 |
+| **SSA** | w=112 | +T | `concat(raw, T_ssa)` | 672 |
+| **SSA** | w=112 | +S | `concat(raw, S_ssa)` | 672 |
+| **SSA** | w=168 | +T | `concat(raw, T_ssa)` | 672 |
+| **EMD** | - | +T | `concat(raw, IMF_low)` | 672 |
+| **EMD** | - | +S | `concat(raw, IMF_mid)` | 672 |
+| **Wavelet** | db4,L=3 | +T | `concat(raw, approx)` | 672 |
+| **Wavelet** | db4,L=3 | +S | `concat(raw, details)` | 672 |
+| **STD_MULTI** | bs=24 | +T | `concat(raw, T_std)` | 672 |
+| **STD_MULTI** | bs=24 | +S | `concat(raw, S_std)` | 672 |
 
 ### 评估指标
 
@@ -137,17 +251,33 @@ feature = np.concatenate([raw[-336:], component[-336:]])  # shape: (672,)
 - [ ] 运行 Ridge Baseline（原始序列，lookback=336）
 - [ ] 记录所有数据集、所有 horizon 的 Baseline 性能
 
-### Phase 3: 分解成分实验
-- [ ] **STL 分解**: 所有数据集 × T, S 成分
-- [ ] **SSA 分解**: 所有数据集 × T, S 成分
-- [ ] **EMD 分解**: 所有数据集 × T, S 成分
-- [ ] **MA_BASELINE 分解**: 所有数据集 × T, S 成分
-- [ ] **WAVELET 分解**: 所有数据集 × T, S 成分
-- [ ] **STD_MULTI 分解**: 所有数据集 × T, S 成分
+### Phase 3: 单尺度分解实验
+#### 3.1 STL 分解（单尺度）
+- [ ] STL-24: 所有数据集 × (+T, +S) × 4 horizons
+- [ ] STL-168: 所有数据集 × (+T, +S) × 4 horizons
 
-### Phase 4: 结果分析
+#### 3.2 SSA 分解（不同窗口）
+- [ ] SSA-w112: 所有数据集 × (+T, +S) × 4 horizons
+- [ ] SSA-w168: 所有数据集 × (+T, +S) × 4 horizons
+- [ ] 验证 SSA 成分分组策略（trend_indices, seasonal_indices）
+
+#### 3.3 其他分解方法
+- [ ] EMD: 所有数据集 × (+T, +S) × 4 horizons
+- [ ] Wavelet: 所有数据集 × (+T, +S) × 4 horizons
+- [ ] STD_MULTI: 所有数据集 × (+T, +S) × 4 horizons
+- [ ] MA_BASELINE: 所有数据集 × (+T, +S) × 4 horizons
+
+### Phase 4: 多尺度分解实验（可选）
+- [ ] **STL-Multi-T**: `concat(raw, T_24, T_168)` - 多尺度趋势
+- [ ] **STL-Multi-S**: `concat(raw, S_24, S_168)` - 多尺度季节
+- [ ] **STL-Multi-TS**: `concat(raw, T_24, S_24)` - 单尺度混合
+- [ ] **STL-Cross**: `concat(raw, T_24, S_168)` - 跨尺度组合
+
+### Phase 5: 结果分析
 - [ ] 汇总所有实验结果到统一 CSV
 - [ ] 计算各成分相对 Baseline 的提升/下降
+- [ ] 对比单尺度 vs 多尺度性能
+- [ ] 分析 SSA 窗口大小的影响
 - [ ] 生成可视化报告
 
 ---
@@ -169,6 +299,17 @@ feature = np.concatenate([raw[-336:], component[-336:]])  # shape: (672,)
 - **假设2**: 季节性成分 (S) 在周期性强的数据（如 Electricity、Traffic）上表现更好
 - **假设3**: SSA 和 Wavelet 的趋势成分优于 STL
 - **假设4**: 长期预测 (720) 更依赖趋势成分，短期预测 (96) 更依赖季节性成分
+- **假设5**: 多尺度趋势 (Multi-T) 比单尺度趋势性能更好
+- **假设6**: SSA 窗口大小影响成分质量：window=336/3 优于 336/2
+- **假设7**: Per-Window 分解（当前）对自适应方法（EMD/Wavelet）更有效
+- **假设8**: 多尺度组合 (Multi-TS) 在长期预测中表现最佳
+
+### 关键研究问题
+1. **分解模式选择**：Per-Window vs Global Pattern 哪种更适合实际预测？
+2. **多尺度增益**：多尺度成分是否比单尺度显著提升性能？
+3. **SSA 参数敏感性**：窗口大小和成分分组策略如何影响结果？
+4. **成分互补性**：趋势+季节性组合是否优于单独使用？
+5. **方法适用性**：哪些方法在哪些数据集/horizon上表现最佳？
 
 ---
 
