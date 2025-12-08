@@ -11,62 +11,40 @@ dataset:
 
 # Multi-scale decomposition methods
 decomp_methods:
-  # Single-scale baseline (for comparison)
+  # STL multi-scale from full train
   - method: "STL"
-    params:
-      period: 24
-    label: "STL-24"
-  
-  - method: "STL"
-    params:
-      period: 168
-    label: "STL-168"
-  
-  # Multi-scale STL (MSTL)
-  - method: "MSTL"
-    params:
-      periods: [24, 168]  # Daily + Weekly
-    label: "MSTL-24-168"
-  
-  # SSA with different window sizes
+    multi_scales:
+      - {period: 24}
+      - {period: 168}
+    label: "STL-MS"
+
+  # SSA multi-scale from full train
   - method: "SSA"
-    params:
-      window: 112  # lookback / 3
-      n_components: 10
-      trend_indices: [0, 1, 2]
-      seasonal_indices: [3, 4, 5, 6]
-    label: "SSA-w112"
-  
-  - method: "SSA"
-    params:
-      window: 168  # lookback / 2
-      n_components: 10
-      trend_indices: [0, 1, 2]
-      seasonal_indices: [3, 4, 5, 6]
-    label: "SSA-w168"
-  
-  # STD_MULTI with multiple block sizes
+    multi_scales:
+      - {window: 112, n_components: 10, trend_indices: [0,1,2], seasonal_indices: [3,4,5,6]}
+      - {window: 168, n_components: 10, trend_indices: [0,1,2], seasonal_indices: [3,4,5,6]}
+    label: "SSA-MS"
+
+  # STD_MULTI multi-scale
   - method: "STD_MULTI"
-    params:
-      block_size: 24
-    label: "STD-24"
-  
-  - method: "STD_MULTI"
-    params:
-      block_size: 168
-    label: "STD-168"
+    multi_scales:
+      - {block_size: 24, seasonal_rank: 6}
+      - {block_size: 168, seasonal_rank: 5}
+    label: "STD-MS"
 
 horizons: [96, 192, 336, 720]
 lookback: 336
+decomp_mode: "global"
 
 # Ablation study: test different component combinations
-ablation_components:
+ablation_modes:
   - "RAW"      # Baseline
-  - "+T"       # Raw + Trend
-  - "+S"       # Raw + Seasonal
-  - "+TS"      # Raw + Trend + Seasonal (multi-scale)
-  - "T"        # Trend only
-  - "S"        # Seasonal only
+  - "+T"       # Raw + single-scale Trend (first scale)
+  - "+S"       # Raw + single-scale Seasonal (first scale)
+  - "+TS"      # Raw + single-scale T+S (first scale)
+  - "MS_T"     # Raw + multi-scale Trend
+  - "MS_S"     # Raw + multi-scale Seasonal
+  - "MS_TS"    # Raw + multi-scale T+S
 
 learner:
   type: "Ridge"

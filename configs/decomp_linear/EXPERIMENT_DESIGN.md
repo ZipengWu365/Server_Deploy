@@ -98,73 +98,64 @@ result = decompose(x, cfg)
 | Alpha | 1.0 | 正则化强度 |
 | Seed | 42 | 随机种子 |
 
-### 分解模式选择：Per-Window vs Global Pattern
+### 分解模式：全局模式 (Global Pattern) —— 统一采用
 
-**重要决策**：测试时是否需要重新分解？
+> ❗ 关键决策：**只在训练集上分解一次**，提取全局多尺度的 S/T，并在测试时直接复用（按时间切片）。
 
-#### 模式A：Per-Window Decomposition（当前实现）
+#### 工作流程
 ```python
-# 每个滑动窗口独立分解
-for window in test_windows:
-    trend, seasonal = decompose(window)
-    feature = concat(window, trend, seasonal)
+# 训练阶段：分解“完整训练集”，得到多尺度 S/T
+trend_scales, seasonal_scales = decompose(train_sequence, multi_scales)
+
+# 对每个滑动窗口构造特征（训练/测试都用同一套全局模式）
+for i, window in enumerate(windows):
+  trend_slice = trend_scales[k][i:i+lookback]      # 第k个尺度的趋势片段
+  seasonal_slice = seasonal_scales[k][i:i+lookback]
+  feature = concat(window, trend_slice, seasonal_slice, ...)
 ```
-- ✅ 适用于：EMD, Wavelet（自适应方法）
-- ✅ 捕捉局部变化
-- ❌ 计算量大，假设测试时可以看到完整lookback窗口
 
-#### 模式B：Global Pattern Decomposition（推荐用于STL/SSA）
-```python
-# 只在训练集上分解一次
-train_trend, train_seasonal = decompose(train_data)
+#### 特点
+- ✅ 避免窗口级随机波动，提供稳定的周期/趋势模式
+- ✅ 计算高效：分解一次，全程复用
+- ✅ 适配“窗口尺度敏感”方法（如 STL/SSA），多尺度周期来自同一全局分解
+- ✅ 符合真实预测：周期模式在训练阶段确定，测试阶段只做切片/外推
 
-# 测试时使用全局模式
-for i, window in enumerate(test_windows):
-    # 使用训练集学到的周期/趋势模式
-    trend_slice = train_trend[i:i+336]
-    seasonal_slice = train_seasonal[i:i+336]
-    feature = concat(window, trend_slice, seasonal_slice)
-```
-- ✅ 适用于：STL, SSA（周期性稳定的方法）
-- ✅ 真实场景：周期模式在训练时确定
-- ✅ 计算高效
-- ❌ 假设模式固定
-
-**本实验采用模式A**，未来可扩展支持模式B。
+#### 本设计只保留 Global Pattern，移除 Per-Window 路线
+原因：
+- 目标是“用整个 train 提取的多尺度 S/T”提升特征表示
+- 部分分解方法对窗口尺度敏感，必须用固定的训练集尺度统一分解
+- 测试时不再重新分解，直接复用全局模式
 
 ---
 
-### 多尺度分解实验设计
+### 多尺度分解实验设计（Global Pattern 专用）
 
-每种分解方法在**多个时间尺度**上提取成分：
+每种方法在“全局训练集”上一次性提取**多尺度 S/T**，然后在滑动窗口中做时间切片：
 
-#### 单尺度实验（基础）
+#### 单尺度特征
 | 方法 | 尺度参数 | 成分 | 输入特征 | 特征维度 |
 |------|----------|------|----------|----------|
-| Baseline | - | - | `raw[-336:]` | 336 |
-| STL-24 | period=24 | +T | `concat(raw, trend_24)` | 672 |
-| STL-24 | period=24 | +S | `concat(raw, seasonal_24)` | 672 |
-| STL-168 | period=168 | +T | `concat(raw, trend_168)` | 672 |
-| STL-168 | period=168 | +S | `concat(raw, seasonal_168)` | 672 |
+| Baseline | - | RAW | `raw` | 336 |
+| STL-24 | period=24 | +T | `concat(raw, T_24)` | 672 |
+| STL-24 | period=24 | +S | `concat(raw, S_24)` | 672 |
+| STL-168 | period=168 | +T | `concat(raw, T_168)` | 672 |
+| STL-168 | period=168 | +S | `concat(raw, S_168)` | 672 |
 
-#### 多尺度实验（组合）
+#### 多尺度特征（基于同一全局分解）
 ```python
-# 方案1: 多个尺度的趋势成分
-feature = concat(raw, trend_24, trend_168)  # dim: 336+336+336=1008
-
-# 方案2: 多个尺度的季节性成分  
-feature = concat(raw, seasonal_24, seasonal_168)
-
-# 方案3: 混合多尺度
-feature = concat(raw, trend_24, seasonal_168)
+# 多尺度趋势
+feature = concat(raw, T_24, T_168)           # MS_T
+# 多尺度季节
+feature = concat(raw, S_24, S_168)           # MS_S
+# 多尺度趋势 + 季节
+feature = concat(raw, T_24, T_168, S_24, S_168)  # MS_TS
 ```
 
 | 实验 | 成分组合 | 输入特征 | 特征维度 |
 |------|----------|----------|----------|
-| Multi-T | 多尺度趋势 | `concat(raw, T_24, T_168)` | 1008 |
-| Multi-S | 多尺度季节 | `concat(raw, S_24, S_168)` | 1008 |
-| Multi-TS | 单尺度T+S | `concat(raw, T_24, S_24)` | 1008 |
-| Multi-Mix | 跨尺度混合 | `concat(raw, T_24, S_168)` | 1008 |
+| MS_T | 多尺度趋势 | `concat(raw, T_24, T_168)` | 1008 |
+| MS_S | 多尺度季节 | `concat(raw, S_24, S_168)` | 1008 |
+| MS_TS | 多尺度趋势+季节 | `concat(raw, T_24, T_168, S_24, S_168)` | 1344 |
 
 ---
 

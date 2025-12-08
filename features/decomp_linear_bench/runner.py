@@ -91,6 +91,29 @@ def sliding_xy_univariate(series: np.ndarray, input_len: int, out_len: int) -> T
     
     return X, Y
 
+
+def _extend_component(comp: np.ndarray, total_len: int, period_hint: int = None, kind: str = "trend") -> np.ndarray:
+    """Extend component array to total_len by simple extrapolation/tiling.
+
+    - trend: hold last value
+    - seasonal: tile last period (period_hint) or a minimal repeating segment
+    """
+    comp = comp.astype(np.float32).squeeze()
+    if comp.ndim != 1:
+        comp = comp.flatten()
+    if comp.size >= total_len:
+        return comp[:total_len].copy()
+    if kind.lower().startswith("trend"):
+        pad_val = comp[-1]
+        pad = np.full((total_len - comp.size,), pad_val, dtype=np.float32)
+        return np.concatenate([comp, pad]).astype(np.float32)
+    # seasonal
+    per = int(period_hint) if period_hint else max(1, comp.size // 4)
+    tail = comp[-per:] if per <= comp.size else comp
+    reps = (total_len - comp.size + tail.size - 1) // tail.size
+    ext = np.tile(tail, reps)
+    return np.concatenate([comp, ext])[:total_len].astype(np.float32)
+
 def run_experiment(cfg: Dict[str, Any]):
     """
     Run experiment with decomposition methods and ablation modes.
@@ -137,6 +160,7 @@ def run_experiment(cfg: Dict[str, Any]):
     # Get decomposition and ablation configurations
     decomp_methods = cfg.get("decomp", [])
     ablation_modes = cfg.get("ablation_modes", ["RAW"])
+    decomp_mode = cfg.get("decomp_mode", "global").lower()  # "global" enforced per requirements
     
     all_results = []
     
@@ -201,114 +225,143 @@ def run_experiment(cfg: Dict[str, Any]):
         print(f"\nSaved: {out_csv}")
         return res_df
     
-    # Run decomposition experiments
+    # Run decomposition experiments (GLOBAL PATTERN ONLY)
     for decomp_cfg in decomp_methods:
         method_name = decomp_cfg.get("method", "UNKNOWN")
-        print(f"\n--- Method: {method_name} ---")
-        
+        print(f"\n--- Method: {method_name} (GLOBAL) ---")
+
+        # Support multi-scale: params list
+        multi_scales = decomp_cfg.get("multi_scales", None)
+        param_variants = multi_scales if multi_scales else [decomp_cfg.get("params", {})]
+
         for ablation_mode in ablation_modes:
             if ablation_mode == "RAW":
                 continue  # Already done in baseline
-            
+
             print(f"  Ablation: {ablation_mode}")
-            
+
             for horizon in horizons:
                 sse_total = 0.0
                 sae_total = 0.0
                 mape_sum = 0.0
                 n_total = 0
                 n_feat_total = 0
-                
-                # Process each channel independently
+
                 for c in range(ch):
-                    # Create sliding windows for raw data
+                    # Raw sliding windows
                     X_tr_raw, Y_tr = sliding_xy_univariate(X_train[c], lookback, horizon)
                     X_te_raw, Y_te = sliding_xy_univariate(X_test[c], lookback, horizon)
-                    
                     if X_tr_raw is None or X_te_raw is None:
                         continue
-                    
-                    # Decompose each window independently (NO DATA LEAKAGE)
-                    X_tr_feats_list = []
-                    X_te_feats_list = []
-                    
-                    d_config = DecompositionConfig(method=method_name, params=decomp_cfg.get("params", {}))
-                    
-                    # Process training windows
-                    for i in range(X_tr_raw.shape[0]):
-                        window = X_tr_raw[i]
-                        
+
+                    train_len = X_train[c].shape[0]
+                    val_len = X_val[c].shape[0]
+                    test_len = X_test[c].shape[0]
+                    total_len = train_len + val_len + test_len
+
+                    trend_tr_wins: List[np.ndarray] = []
+                    trend_te_wins: List[np.ndarray] = []
+                    season_tr_wins: List[np.ndarray] = []
+                    season_te_wins: List[np.ndarray] = []
+
+                    # Precompute global components per scale
+                    for param_variant in param_variants:
+                        d_config = DecompositionConfig(method=method_name, params=param_variant)
                         try:
-                            res = decompose(window, d_config)
-                            
-                            # Build feature vector based on ablation mode
-                            if ablation_mode == "+T":
-                                feat = np.concatenate([window, res.trend])
-                            elif ablation_mode == "+S":
-                                feat = np.concatenate([window, res.season])
-                            elif ablation_mode == "T":
-                                feat = res.trend
-                            elif ablation_mode == "S":
-                                feat = res.season
-                            else:
-                                feat = window
-                            
-                            X_tr_feats_list.append(feat)
-                        except Exception as e:
-                            # If decomposition fails, use raw window
-                            X_tr_feats_list.append(window)
-                    
-                    # Process test windows
-                    for i in range(X_te_raw.shape[0]):
-                        window = X_te_raw[i]
-                        
-                        try:
-                            res = decompose(window, d_config)
-                            
-                            # Build feature vector based on ablation mode
-                            if ablation_mode == "+T":
-                                feat = np.concatenate([window, res.trend])
-                            elif ablation_mode == "+S":
-                                feat = np.concatenate([window, res.season])
-                            elif ablation_mode == "T":
-                                feat = res.trend
-                            elif ablation_mode == "S":
-                                feat = res.season
-                            else:
-                                feat = window
-                            
-                            X_te_feats_list.append(feat)
-                        except Exception as e:
-                            # If decomposition fails, use raw window
-                            X_te_feats_list.append(window)
-                    
+                            res = decompose(X_train[c], d_config)  # use TRAIN ONLY
+                        except Exception:
+                            # Fallback: use raw (no decomposition)
+                            res = None
+
+                        if res is None:
+                            # pad with zeros to maintain alignment
+                            trend_full = np.zeros(total_len, dtype=np.float32)
+                            season_full = np.zeros(total_len, dtype=np.float32)
+                        else:
+                            period_hint = param_variant.get("period") or param_variant.get("block_size") or param_variant.get("window")
+                            trend_full = _extend_component(res.trend, total_len, period_hint=period_hint, kind="trend")
+                            season_full = _extend_component(res.season, total_len, period_hint=period_hint, kind="seasonal")
+
+                        # Slice train/test components
+                        trend_tr_full = trend_full[:train_len]
+                        trend_te_full = trend_full[train_len + val_len:]
+                        season_tr_full = season_full[:train_len]
+                        season_te_full = season_full[train_len + val_len:]
+
+                        X_tr_trend, _ = sliding_xy_univariate(trend_tr_full, lookback, horizon)
+                        X_te_trend, _ = sliding_xy_univariate(trend_te_full, lookback, horizon)
+                        X_tr_season, _ = sliding_xy_univariate(season_tr_full, lookback, horizon)
+                        X_te_season, _ = sliding_xy_univariate(season_te_full, lookback, horizon)
+
+                        if X_tr_trend is None or X_te_trend is None:
+                            continue
+
+                        trend_tr_wins.append(X_tr_trend)
+                        trend_te_wins.append(X_te_trend)
+                        season_tr_wins.append(X_tr_season)
+                        season_te_wins.append(X_te_season)
+
+                    # Ensure counts match raw windows
+                    if not trend_tr_wins and not season_tr_wins:
+                        continue
+                    num_tr = X_tr_raw.shape[0]
+                    num_te = X_te_raw.shape[0]
+                    if (trend_tr_wins and trend_tr_wins[0].shape[0] != num_tr) or (season_tr_wins and season_tr_wins[0].shape[0] != num_tr):
+                        continue
+                    if (trend_te_wins and trend_te_wins[0].shape[0] != num_te) or (season_te_wins and season_te_wins[0].shape[0] != num_te):
+                        continue
+
+                    def build_feat(raw_win: np.ndarray, trend_list: List[np.ndarray], season_list: List[np.ndarray], idx: int) -> np.ndarray:
+                        t_parts = [t[idx] for t in trend_list] if trend_list else []
+                        s_parts = [s[idx] for s in season_list] if season_list else []
+
+                        if ablation_mode == "+T":
+                            return np.concatenate([raw_win, t_parts[0]]) if t_parts else raw_win
+                        if ablation_mode == "+S":
+                            return np.concatenate([raw_win, s_parts[0]]) if s_parts else raw_win
+                        if ablation_mode == "+TS":
+                            return np.concatenate([raw_win, t_parts[0], s_parts[0]]) if (t_parts and s_parts) else raw_win
+                        if ablation_mode == "T":
+                            return t_parts[0] if t_parts else raw_win
+                        if ablation_mode == "S":
+                            return s_parts[0] if s_parts else raw_win
+                        if ablation_mode == "MS_T":
+                            return np.concatenate([raw_win] + t_parts) if t_parts else raw_win
+                        if ablation_mode == "MS_S":
+                            return np.concatenate([raw_win] + s_parts) if s_parts else raw_win
+                        if ablation_mode == "MS_TS":
+                            return np.concatenate([raw_win] + t_parts + s_parts) if (t_parts or s_parts) else raw_win
+                        return raw_win
+
+                    X_tr_feats_list = [build_feat(X_tr_raw[i], trend_tr_wins, season_tr_wins, i) for i in range(num_tr)]
+                    X_te_feats_list = [build_feat(X_te_raw[i], trend_te_wins, season_te_wins, i) for i in range(num_te)]
+
                     if not X_tr_feats_list or not X_te_feats_list:
                         continue
-                    
+
                     X_tr_feats = np.array(X_tr_feats_list, dtype=np.float32)
                     X_te_feats = np.array(X_te_feats_list, dtype=np.float32)
-                    
                     n_feat_total = X_tr_feats.shape[1]
-                    
+
                     # Standardize features
                     scaler = StandardScaler(with_mean=True, with_std=True)
                     X_tr_scaled = scaler.fit_transform(X_tr_feats.astype(np.float32))
                     X_te_scaled = scaler.transform(X_te_feats.astype(np.float32))
-                    
+
                     # Train Ridge regression
                     model = Ridge(alpha=alpha, solver='auto')
                     model.fit(X_tr_scaled, Y_tr.astype(np.float32))
-                    
+
                     # Predict
                     Y_pred = model.predict(X_te_scaled).astype(np.float32)
-                    
+
                     # Calculate errors
                     diff = Y_pred - Y_te.astype(np.float32)
                     sse_total += float(np.sum(diff * diff))
                     sae_total += float(np.sum(np.abs(diff)))
                     mape_sum += float(np.sum(np.abs(diff) / (np.abs(Y_te) + 1e-8)))
                     n_total += int(diff.size)
-                
+
                 if n_total == 0:
                     mse = np.nan
                     mae = np.nan
@@ -317,9 +370,9 @@ def run_experiment(cfg: Dict[str, Any]):
                     mse = sse_total / n_total
                     mae = sae_total / n_total
                     mape = 100.0 * mape_sum / n_total
-                
+
                 print(f"    [{method_name} {ablation_mode}] H={horizon:3d} | MSE={mse:.4f}  MAE={mae:.4f}  MAPE={mape:.2f}%")
-                
+
                 all_results.append({
                     "dataset": dataset_name, "decomp": method_name, "horizon": horizon,
                     "ablation": ablation_mode, "learner": "Ridge", "n_feat": n_feat_total,
